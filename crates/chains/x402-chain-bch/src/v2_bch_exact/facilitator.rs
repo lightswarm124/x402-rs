@@ -16,7 +16,7 @@ use crate::provider::{
 };
 use crate::settlement::{BchSettlementClaim, BchSettlementStore, InMemoryBchSettlementStore};
 use crate::transaction::{
-    BchNft, BchPolicy, BchTransaction, VerifiedPayment, parse_cash_token_nft,
+    BchNft, BchPolicy, BchTransaction, VerifiedPayment, is_p2pkh_script, parse_cash_token_nft,
     payment_target_with_nft, verify_payment,
 };
 use crate::v2_bch_exact::V2BchExact;
@@ -204,13 +204,18 @@ where
                 Ok(BchTransactionStatus::Mempool | BchTransactionStatus::Confirmed { .. }) => {
                     expected_txid
                 }
-                _ => {
+                Ok(BchTransactionStatus::NotFound) => {
                     self.settlement_store
                         .release(&expected_txid.to_string())
                         .await;
                     return Err(X402SchemeFacilitatorError::OnchainFailure(
                         error.to_string(),
                     ));
+                }
+                Ok(BchTransactionStatus::Unknown | BchTransactionStatus::Conflicted) | Err(_) => {
+                    return Err(X402SchemeFacilitatorError::OnchainFailure(format!(
+                        "broadcast outcome unknown: {error}"
+                    )));
                 }
             },
         };
@@ -224,11 +229,16 @@ where
             ));
         }
 
-        let status = self
+        let status = match self
             .provider
             .transaction_status(&txid)
             .await
-            .map_err(|error| X402SchemeFacilitatorError::OnchainFailure(error.to_string()))?;
+            .map_err(|error| X402SchemeFacilitatorError::OnchainFailure(error.to_string()))?
+        {
+            // The node accepted the broadcast; Fulcrum indexes its mempool a moment later.
+            BchTransactionStatus::NotFound => BchTransactionStatus::Mempool,
+            status => status,
+        };
         if self.settlement_accepted(&txid, status).await? {
             self.settlement_store.mark_accepted(&txid.to_string()).await;
             return Ok(v2::SettleResponse::Success {
@@ -333,7 +343,12 @@ where
                     let tip = self.provider.tip_height().await.map_err(|error| {
                         X402SchemeFacilitatorError::OnchainFailure(error.to_string())
                     })?;
-                    let confirmations = tip.saturating_sub(height).saturating_add(1);
+                    let Some(depth) = tip.checked_sub(height) else {
+                        return Ok(false);
+                    };
+                    let Some(confirmations) = depth.checked_add(1) else {
+                        return Ok(false);
+                    };
                     Ok(confirmations >= required)
                 }
                 _ => Ok(false),
@@ -391,6 +406,7 @@ where
         .map_err(|_| proto::PaymentVerificationError::UnsupportedChain)?;
     let pay_to = CashAddr::decode_script(&requirements.pay_to, network)
         .map_err(|error| proto::PaymentVerificationError::InvalidFormat(error.to_string()))?;
+    let merchant_script = pay_to.locking_script();
     let target = payment_target_with_nft(
         &requirements.asset,
         &requirements.amount,
@@ -402,6 +418,7 @@ where
             &requirements.amount,
         )
         .map_err(|error| proto::PaymentVerificationError::InvalidFormat(error.to_string()))?,
+        &merchant_script,
         policy,
     )
     .map_err(|error| proto::PaymentVerificationError::InvalidFormat(error.to_string()))?;
@@ -442,11 +459,23 @@ where
         &transaction,
         &source_outputs,
         network,
-        &pay_to.locking_script(),
+        &merchant_script,
         &target,
         policy,
     )
     .map_err(|error| proto::PaymentVerificationError::TransactionSimulation(error.to_string()))?;
+    // There is no script VM here. A configured node runs the scripts of
+    // non-P2PKH inputs now; otherwise the network runs them at broadcast.
+    if require_unspent
+        && source_outputs
+            .iter()
+            .any(|source| !is_p2pkh_script(&source.script_pubkey))
+        && let Some(Err(reason)) = provider.test_mempool_accept(&raw_transaction).await
+    {
+        return Err(proto::PaymentVerificationError::TransactionSimulation(
+            format!("BCH node rejected the transaction: {reason}"),
+        ));
+    }
     Ok(VerifiedBchPayment {
         transaction,
         payment,

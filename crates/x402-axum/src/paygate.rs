@@ -168,6 +168,16 @@ pub trait PaygateProtocol: Clone + Send + Sync + 'static {
     /// Called by middleware when building 402 response to add extra information like fee payer
     /// from the facilitator's supported endpoints.
     fn enrich_with_capabilities(&mut self, capabilities: &SupportedResponse);
+
+    /// Whether this offered price must settle before the protected handler runs.
+    fn settles_upfront(&self) -> bool {
+        false
+    }
+
+    /// Whether the requirements accepted by this payload settle before execution.
+    fn selected_settles_upfront(_payload: &Self::PaymentPayload, _accepts: &[Self]) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -294,22 +304,35 @@ impl PaygateProtocol for v2::PriceTag {
 
     const PAYMENT_HEADER_NAME: &'static str = "Payment-Signature";
 
-    fn make_verify_request(
-        payment_payload: Self::PaymentPayload,
-        accepts: &[Self],
-        _resource: &v2::ResourceInfo,
-    ) -> Result<proto::VerifyRequest, VerificationError> {
-        // In V2, the accepted requirements are embedded in the payload
-        // Resource info is already included in the payment payload from the client
-        let accepted = &payment_payload.accepted;
+    fn settles_upfront(&self) -> bool {
+        self.requirements
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("paymentFlow"))
+            .and_then(|flow| flow.as_str())
+            == Some("upfront")
+    }
 
-        // Find matching requirements from our accepts list
-        // According to V2 spec, the accepted requirements must exactly match
-        // one of the requirements we offered in PaymentRequired.accepts
+    fn selected_settles_upfront(payload: &Self::PaymentPayload, accepts: &[Self]) -> bool {
+        accepts
+            .iter()
+            .any(|price_tag| *price_tag == payload.accepted && price_tag.settles_upfront())
+    }
+
+    fn make_verify_request(
+        mut payment_payload: Self::PaymentPayload,
+        accepts: &[Self],
+        resource: &v2::ResourceInfo,
+    ) -> Result<proto::VerifyRequest, VerificationError> {
+        // In V2, the accepted requirements are embedded in the payload.
+        // Upfront schemes bind settlement to the server resource, not the client copy.
         let selected = accepts
             .iter()
-            .find(|price_tag| **price_tag == *accepted)
+            .find(|price_tag| **price_tag == payment_payload.accepted)
             .ok_or(VerificationError::NoPaymentMatching)?;
+        if selected.settles_upfront() {
+            payment_payload.resource = Some(resource.clone());
+        }
 
         // Build the V2 verify request
         let verify_request = v2::VerifyRequest {
@@ -531,10 +554,12 @@ where
         let payment_payload = extract_payment_payload::<TPriceTag::PaymentPayload>(header)
             .ok_or(VerificationError::InvalidPaymentHeader)?;
 
+        let settle_first = self.settle_before_execution
+            || TPriceTag::selected_settles_upfront(&payment_payload, &self.accepts);
         let verify_request =
             TPriceTag::make_verify_request(payment_payload, &self.accepts, &self.resource)?;
 
-        if self.settle_before_execution {
+        if settle_first {
             // Settlement before execution: settle payment first, then call inner handler
             #[cfg(feature = "telemetry")]
             tracing::debug!("Settling payment before request execution");
@@ -956,5 +981,360 @@ mod tests {
         let resp = settle_response(json!({}));
         let err = validate_settlement(&resp).unwrap_err();
         assert!(err.to_string().contains("missing boolean"));
+    }
+
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use x402_types::facilitator::Facilitator;
+    use x402_types::util::Base64Bytes;
+
+    #[derive(Clone, Copy)]
+    enum ScriptedMode {
+        Success,
+        Pending,
+        Claim,
+    }
+
+    #[derive(Clone)]
+    struct Scripted {
+        events: Arc<Mutex<Vec<String>>>,
+        urls: Arc<Mutex<Vec<String>>>,
+        claims: Arc<Mutex<HashMap<String, String>>>,
+        mode: ScriptedMode,
+    }
+
+    impl Scripted {
+        fn new(mode: ScriptedMode) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                urls: Arc::new(Mutex::new(Vec::new())),
+                claims: Arc::new(Mutex::new(HashMap::new())),
+                mode,
+            }
+        }
+    }
+
+    impl Facilitator for Scripted {
+        type Error = String;
+
+        fn verify(
+            &self,
+            _request: &proto::VerifyRequest,
+        ) -> impl Future<Output = Result<proto::VerifyResponse, Self::Error>> + Send {
+            self.events.lock().unwrap().push("verify".to_string());
+            async { Ok(v1::VerifyResponse::valid("payer".to_string()).into()) }
+        }
+
+        fn settle(
+            &self,
+            request: &proto::SettleRequest,
+        ) -> impl Future<Output = Result<proto::SettleResponse, Self::Error>> + Send {
+            self.events.lock().unwrap().push("settle".to_string());
+            let body = request.as_str().to_string();
+            let mode = self.mode;
+            let urls = self.urls.clone();
+            let claims = self.claims.clone();
+            async move {
+                let json: serde_json::Value =
+                    serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                let url = json
+                    .pointer("/paymentPayload/resource/url")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tx = json
+                    .pointer("/paymentPayload/payload/transaction")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tx")
+                    .to_string();
+                urls.lock().unwrap().push(url.clone());
+                match mode {
+                    ScriptedMode::Pending => Ok(proto::SettleResponse(json!({
+                        "success": false,
+                        "errorReason": "settlement_pending"
+                    }))),
+                    ScriptedMode::Success => Ok(proto::SettleResponse(json!({
+                        "success": true,
+                        "payer": "payer",
+                        "transaction": tx,
+                        "network": "bch:bitcoincash"
+                    }))),
+                    ScriptedMode::Claim => {
+                        let mut claims = claims.lock().unwrap();
+                        match claims.get(&tx) {
+                            Some(existing) if existing == &url => {
+                                Ok(proto::SettleResponse(json!({
+                                    "success": true,
+                                    "payer": "payer",
+                                    "transaction": tx,
+                                    "network": "bch:bitcoincash"
+                                })))
+                            }
+                            Some(_) => {
+                                Err("transaction already claimed for another request".to_string())
+                            }
+                            None => {
+                                claims.insert(tx.clone(), url);
+                                Ok(proto::SettleResponse(json!({
+                                    "success": true,
+                                    "payer": "payer",
+                                    "transaction": tx,
+                                    "network": "bch:bitcoincash"
+                                })))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        async fn supported(&self) -> Result<proto::SupportedResponse, Self::Error> {
+            Ok(proto::SupportedResponse::default())
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn price(flow: Option<&str>) -> v2::PriceTag {
+        let mut extra = json!({"assetTransferMethod": "native"});
+        if let Some(flow) = flow {
+            extra["paymentFlow"] = json!(flow);
+        }
+        v2::PriceTag {
+            requirements: v2::PaymentRequirements {
+                scheme: "exact".to_string(),
+                network: "bch:bitcoincash".parse().unwrap(),
+                amount: "1000".to_string(),
+                pay_to: "bitcoincash:qqg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zye3kwllue".to_string(),
+                max_timeout_seconds: 300,
+                asset: "BCH".to_string(),
+                extra: Some(extra),
+            },
+            enricher: None,
+        }
+    }
+
+    fn payment_header(requirements: &v2::PaymentRequirements, resource: &str) -> String {
+        let payload = v2::PaymentPayload {
+            accepted: requirements.clone(),
+            payload: json!({"transaction": "same-tx"}),
+            resource: Some(v2::ResourceInfo {
+                url: resource.to_string(),
+                description: None,
+                mime_type: None,
+            }),
+            x402_version: v2::X402Version2,
+            extensions: ExtensionsJson::default(),
+        };
+        Base64Bytes::encode(serde_json::to_vec(&payload).unwrap()).to_string()
+    }
+
+    fn paid_request(header: &str) -> Request {
+        let mut request = Request::builder().uri("/paid").body(Body::empty()).unwrap();
+        request
+            .headers_mut()
+            .insert("Payment-Signature", HeaderValue::from_str(header).unwrap());
+        request
+    }
+
+    fn counting_handler(
+        calls: Arc<AtomicUsize>,
+        events: Arc<Mutex<Vec<String>>>,
+    ) -> impl tower::Service<
+        Request,
+        Response = Response,
+        Error = Infallible,
+        Future = impl Future<Output = Result<Response, Infallible>> + Send,
+    > {
+        tower::service_fn(move |_request: Request| {
+            let calls = calls.clone();
+            let events = events.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                events.lock().unwrap().push("handler".to_string());
+                Ok(Response::new(Body::from("paid")))
+            }
+        })
+    }
+
+    fn gate(scripted: Scripted, tag: v2::PriceTag, url: &str) -> Paygate<v2::PriceTag, Scripted> {
+        Paygate {
+            facilitator: scripted,
+            settle_before_execution: false,
+            accepts: Arc::new(vec![tag]),
+            resource: v2::ResourceInfo {
+                url: url.to_string(),
+                description: None,
+                mime_type: None,
+            },
+            extensions: Arc::new(ExtensionsJson::default()),
+        }
+    }
+
+    #[test]
+    fn upfront_pending_settlement_does_not_run_handler() {
+        let scripted = Scripted::new(ScriptedMode::Pending);
+        let tag = price(Some("upfront"));
+        let header = payment_header(&tag.requirements, "https://attacker.example/paid");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = runtime()
+            .block_on(
+                gate(scripted.clone(), tag, "https://merchant.example/item").handle_request(
+                    counting_handler(calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            scripted.events.lock().unwrap().as_slice(),
+            ["settle".to_string()]
+        );
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[test]
+    fn upfront_success_runs_handler_only_after_settlement() {
+        let scripted = Scripted::new(ScriptedMode::Success);
+        let tag = price(Some("upfront"));
+        let header = payment_header(&tag.requirements, "https://attacker.example/paid");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = runtime()
+            .block_on(
+                gate(scripted.clone(), tag, "https://merchant.example/item").handle_request(
+                    counting_handler(calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scripted.events.lock().unwrap().as_slice(),
+            ["settle".to_string(), "handler".to_string()]
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            scripted.urls.lock().unwrap().as_slice(),
+            ["https://merchant.example/item".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_upfront_still_runs_handler_before_failed_settlement() {
+        let scripted = Scripted::new(ScriptedMode::Pending);
+        let tag = price(None);
+        let header = payment_header(&tag.requirements, "https://client.example/resource");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = runtime()
+            .block_on(
+                gate(scripted.clone(), tag, "https://merchant.example/item").handle_request(
+                    counting_handler(calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scripted.events.lock().unwrap().as_slice(),
+            [
+                "verify".to_string(),
+                "handler".to_string(),
+                "settle".to_string()
+            ]
+        );
+        assert_eq!(
+            scripted.urls.lock().unwrap().as_slice(),
+            ["https://client.example/resource".to_string()]
+        );
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[test]
+    fn upfront_cross_resource_replay_does_not_run_second_handler() {
+        let scripted = Scripted::new(ScriptedMode::Claim);
+        let tag = price(Some("upfront"));
+        let header = payment_header(&tag.requirements, "https://attacker.example/paid");
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime();
+        let first = runtime
+            .block_on(
+                gate(
+                    scripted.clone(),
+                    tag.clone(),
+                    "https://merchant.example/one",
+                )
+                .handle_request(
+                    counting_handler(first_calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        let second = runtime
+            .block_on(
+                gate(scripted.clone(), tag, "https://merchant.example/two").handle_request(
+                    counting_handler(second_calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            scripted.urls.lock().unwrap().as_slice(),
+            [
+                "https://merchant.example/one".to_string(),
+                "https://merchant.example/two".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn upfront_same_resource_retry_is_idempotent() {
+        let scripted = Scripted::new(ScriptedMode::Claim);
+        let tag = price(Some("upfront"));
+        let header = payment_header(&tag.requirements, "https://attacker.example/paid");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime();
+        let first = runtime
+            .block_on(
+                gate(
+                    scripted.clone(),
+                    tag.clone(),
+                    "https://merchant.example/item",
+                )
+                .handle_request(
+                    counting_handler(calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        let second = runtime
+            .block_on(
+                gate(scripted.clone(), tag, "https://merchant.example/item").handle_request(
+                    counting_handler(calls.clone(), scripted.events.clone()),
+                    paid_request(&header),
+                ),
+            )
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            scripted.urls.lock().unwrap().as_slice(),
+            [
+                "https://merchant.example/item".to_string(),
+                "https://merchant.example/item".to_string()
+            ]
+        );
     }
 }

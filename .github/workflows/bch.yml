@@ -19,6 +19,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -28,3 +29,51 @@ jobs:
 
       - name: Test BCH crate
         run: cargo test --locked -p x402-chain-bch --lib
+
+      - name: Test BCH crate with the WebSocket transport
+        run: cargo test --locked -p x402-chain-bch --lib --features websocket
+
+      - name: Install Clang for the wasm32 libsecp256k1 build
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build BCH crate for wasm32
+        run: cargo build --locked -p x402-chain-bch --target wasm32-unknown-unknown
+
+  bch-browser:
+    name: offline browser vectors
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Clang for the wasm32 libsecp256k1 build
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Write native offline vectors
+        run: cargo test --locked -p x402-chain-bch --lib offline_nft_commitments
+        env:
+          BCH_BROWSER_VECTORS: ${{ runner.temp }}/bch-browser-vectors.json
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build the browser package
+        run: wasm-pack build crates/chains/x402-chain-bch --target web --out-dir ../../../examples/bch-browser/pkg
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the offline browser runner
+        working-directory: examples/bch-browser
+        run: npm install && npx playwright install --with-deps chromium
+
+      - name: Compare browser payments with native Rust
+        working-directory: examples/bch-browser
+        run: node offline-check.mjs ${{ runner.temp }}/bch-browser-vectors.json

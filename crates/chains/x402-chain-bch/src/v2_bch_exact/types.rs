@@ -11,13 +11,24 @@ pub enum BchTransactionNetwork {
     Chipnet,
 }
 
+/// The payment a wallet must build. It has the same shape as
+/// `BchTransactionRequest` in `@optnlabs/x402-bch`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BchTransactionRequest {
     pub network: BchTransactionNetwork,
-    pub recipient: String,
-    pub amount: String,
+    /// Merchant destination. The wallet may use another address for change.
+    pub recipient: BchRecipient,
+    /// Satoshis on the merchant output. CashToken requests include the quoted
+    /// value, or the size-aware default when the price omitted it.
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<BchTokenRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BchRecipient {
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,7 +36,16 @@ pub struct BchTransactionRequest {
 pub struct BchExtra {
     pub asset_transfer_method: String,
     pub payment_flow: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Satoshis on the CashToken merchant output.
+    ///
+    /// The x402 wire name is `value`, matching `@optnlabs/x402-bch`. A message
+    /// that still uses `tokenOutputValue` is accepted.
+    #[serde(
+        default,
+        rename = "value",
+        alias = "tokenOutputValue",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub token_output_value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<BchTokenRequest>,
@@ -36,6 +56,7 @@ pub struct BchExtra {
 pub struct BchTokenRequest {
     pub category: String,
     pub amount: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nft: Option<BchNftRequest>,
 }
 

@@ -9,16 +9,20 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::TcpStream;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::Mutex;
 use x402_types::chain::{ChainId, ChainProviderOps};
 
 use crate::address::{CashAddr, p2pkh_script};
 use crate::chain::BchChainReference;
 use crate::transaction::{
-    BchNft, BchToken, BchTokenCapability, OutPoint, SourceOutput, TxId, is_p2pkh_script,
+    BchNft, BchToken, BchTokenCapability, MAX_TOKEN_COMMITMENT_LENGTH, OutPoint, SourceOutput, TxId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,11 +90,69 @@ pub trait BchChainProvider: ChainProviderOps + Send + Sync {
     /// transaction. The provider must document whether it validates the proof
     /// cryptographically or merely reports node/indexer state.
     async fn has_double_spend_proof(&self, txid: &TxId) -> Result<bool, BchProviderError>;
+
+    /// Asks a node whether it would accept `transaction` into its mempool,
+    /// scripts included, without broadcasting it. `None` means no node
+    /// answered, and the network judges the scripts at broadcast instead.
+    async fn test_mempool_accept(&self, _transaction: &[u8]) -> Option<Result<(), String>> {
+        None
+    }
+}
+
+/// A shared provider, as the x402 facilitator keeps chain providers in `Arc`.
+#[async_trait]
+impl<T: BchChainProvider> BchChainProvider for Arc<T> {
+    async fn source_output(&self, outpoint: &OutPoint) -> Result<SourceOutput, BchProviderError> {
+        (**self).source_output(outpoint).await
+    }
+
+    async fn outpoint_status(
+        &self,
+        outpoint: &OutPoint,
+        source_output: &SourceOutput,
+    ) -> Result<BchOutpointStatus, BchProviderError> {
+        (**self).outpoint_status(outpoint, source_output).await
+    }
+
+    async fn list_utxos(&self, address: &CashAddr) -> Result<Vec<BchUtxo>, BchProviderError> {
+        (**self).list_utxos(address).await
+    }
+
+    async fn broadcast(&self, transaction: &[u8]) -> Result<TxId, BchProviderError> {
+        (**self).broadcast(transaction).await
+    }
+
+    async fn transaction_status(
+        &self,
+        txid: &TxId,
+    ) -> Result<BchTransactionStatus, BchProviderError> {
+        (**self).transaction_status(txid).await
+    }
+
+    async fn tip_height(&self) -> Result<u64, BchProviderError> {
+        (**self).tip_height().await
+    }
+
+    async fn has_double_spend_proof(&self, txid: &TxId) -> Result<bool, BchProviderError> {
+        (**self).has_double_spend_proof(txid).await
+    }
+
+    async fn test_mempool_accept(&self, transaction: &[u8]) -> Option<Result<(), String>> {
+        (**self).test_mempool_accept(transaction).await
+    }
 }
 
 /// Minimal JSON-RPC transport contract for Fulcrum-compatible servers.
 #[async_trait]
 pub trait FulcrumTransport: Clone + Send + Sync + 'static {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, BchProviderError>;
+}
+
+/// JSON-RPC access to a BCH node such as Bitcoin Cash Node. `request` returns
+/// the call's `result`. [`FulcrumProvider::with_node`] uses it for
+/// `testmempoolaccept`.
+#[async_trait]
+pub trait BchNodeRpc: Send + Sync {
     async fn request(&self, method: &str, params: Value) -> Result<Value, BchProviderError>;
 }
 
@@ -132,13 +194,120 @@ impl<T: FulcrumTransport> FulcrumTransport for FailoverFulcrumTransport<T> {
     }
 }
 
+/// The `result` of a JSON-RPC response, or its `error` as a provider error.
+#[cfg(not(target_arch = "wasm32"))]
+fn json_rpc_result(response: Value) -> Result<Value, BchProviderError> {
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Fulcrum error")
+            .to_string();
+        return Err(BchProviderError::Remote { code, message });
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| BchProviderError::InvalidResponse("missing JSON-RPC result".to_string()))
+}
+
+/// Fulcrum over WebSocket, `ws://` or `wss://`, as public Fulcrum servers offer
+/// it (usually port 50004). TLS uses rustls with the ring provider and the
+/// webpki root certificates. Requires the `websocket` feature; any other
+/// transport can still be supplied through [`FulcrumTransport`].
+#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+#[derive(Clone)]
+pub struct FulcrumWebSocketTransport {
+    socket: Arc<
+        Mutex<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>>,
+    >,
+    next_id: Arc<AtomicU64>,
+}
+
+#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+impl FulcrumWebSocketTransport {
+    pub async fn connect(url: &str) -> Result<Self, BchProviderError> {
+        let transport = |error: String| BchProviderError::Transport(error);
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| transport(error.to_string()))?
+        .with_root_certificates(rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ))
+        .with_no_client_auth();
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(8 * 1024 * 1024));
+        let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            url,
+            Some(config),
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(Arc::new(tls))),
+        )
+        .await
+        .map_err(|error| transport(error.to_string()))?;
+        Ok(Self {
+            socket: Arc::new(Mutex::new(socket)),
+            next_id: Arc::new(AtomicU64::new(1)),
+        })
+    }
+}
+
+#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+#[async_trait]
+impl FulcrumTransport for FulcrumWebSocketTransport {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, BchProviderError> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut socket = self.socket.lock().await;
+        socket
+            .send(Message::text(request.to_string()))
+            .await
+            .map_err(|error| BchProviderError::Transport(error.to_string()))?;
+        while let Some(message) = socket.next().await {
+            let text =
+                match message.map_err(|error| BchProviderError::Transport(error.to_string()))? {
+                    Message::Text(text) => text.to_string(),
+                    Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+            let response: Value = serde_json::from_str(&text)
+                .map_err(|error| BchProviderError::InvalidResponse(error.to_string()))?;
+            // Fulcrum sends subscription notifications on the same connection.
+            if response.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            return json_rpc_result(response);
+        }
+        Err(BchProviderError::Transport(
+            "Fulcrum WebSocket closed before the response".to_string(),
+        ))
+    }
+}
+
 /// A newline-delimited Electrum JSON-RPC connection.
+///
+/// Browsers cannot open this socket. Wasm builds use a caller-supplied
+/// transport instead of compiling TCP into the crate.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct FulcrumTcpTransport {
     stream: Arc<Mutex<TcpStream>>,
     next_id: Arc<AtomicU64>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FulcrumTcpTransport {
     pub async fn connect(address: &str) -> Result<Self, BchProviderError> {
         let stream = TcpStream::connect(address)
@@ -151,6 +320,7 @@ impl FulcrumTcpTransport {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl FulcrumTransport for FulcrumTcpTransport {
     async fn request(&self, method: &str, params: Value) -> Result<Value, BchProviderError> {
@@ -201,18 +371,7 @@ impl FulcrumTransport for FulcrumTcpTransport {
             if response.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
-            if let Some(error) = response.get("error") {
-                let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown Fulcrum error")
-                    .to_string();
-                return Err(BchProviderError::Remote { code, message });
-            }
-            return response.get("result").cloned().ok_or_else(|| {
-                BchProviderError::InvalidResponse("missing JSON-RPC result".to_string())
-            });
+            return json_rpc_result(response);
         }
     }
 }
@@ -222,11 +381,25 @@ impl FulcrumTransport for FulcrumTcpTransport {
 pub struct FulcrumProvider<T> {
     transport: T,
     network: BchChainReference,
+    node: Option<Arc<dyn BchNodeRpc>>,
 }
 
 impl<T> FulcrumProvider<T> {
     pub fn new(transport: T, network: BchChainReference) -> Self {
-        Self { transport, network }
+        Self {
+            transport,
+            network,
+            node: None,
+        }
+    }
+
+    /// Run the scripts of non-P2PKH inputs on `node` during verification,
+    /// through `testmempoolaccept`, instead of leaving them to the network at
+    /// broadcast. Verification falls back to the network if the node does not
+    /// answer.
+    pub fn with_node(mut self, node: impl BchNodeRpc + 'static) -> Self {
+        self.node = Some(Arc::new(node));
+        self
     }
 
     pub fn network(&self) -> BchChainReference {
@@ -288,9 +461,6 @@ impl<T: FulcrumTransport> BchChainProvider for FulcrumProvider<T> {
         outpoint: &OutPoint,
         source_output: &SourceOutput,
     ) -> Result<BchOutpointStatus, BchProviderError> {
-        if !is_p2pkh_script(&source_output.script_pubkey) {
-            return Ok(BchOutpointStatus::Unknown);
-        }
         let mut script_hash = Sha256::digest(&source_output.script_pubkey);
         script_hash.reverse();
         let result = self
@@ -424,7 +594,7 @@ impl<T: FulcrumTransport> BchChainProvider for FulcrumProvider<T> {
                     Ok(BchTransactionStatus::NotFound)
                 }
             }
-            Err(BchProviderError::Remote { code: -5, .. }) => Ok(BchTransactionStatus::NotFound),
+            Err(error) if is_missing_transaction(&error) => Ok(BchTransactionStatus::NotFound),
             Err(error) => Err(error),
         }
     }
@@ -436,6 +606,24 @@ impl<T: FulcrumTransport> BchChainProvider for FulcrumProvider<T> {
             .get("height")
             .and_then(Value::as_u64)
             .ok_or_else(|| BchProviderError::InvalidResponse("invalid chain tip".to_string()))
+    }
+
+    async fn test_mempool_accept(&self, transaction: &[u8]) -> Option<Result<(), String>> {
+        let result = self
+            .node
+            .as_ref()?
+            .request("testmempoolaccept", json!([[hex::encode(transaction)]]))
+            .await
+            .ok()?;
+        let entry = result.get(0)?;
+        if entry.get("allowed").and_then(Value::as_bool)? {
+            return Some(Ok(()));
+        }
+        let reason = entry
+            .get("reject-reason")
+            .and_then(Value::as_str)
+            .unwrap_or("rejected");
+        Some(Err(reason.to_string()))
     }
 
     async fn has_double_spend_proof(&self, txid: &TxId) -> Result<bool, BchProviderError> {
@@ -497,8 +685,11 @@ fn parse_bch_amount(value: &Value) -> Result<u64, BchProviderError> {
     let amount = if decimal_places <= 8 {
         let scale = u32::try_from(8 - decimal_places)
             .map_err(|_| BchProviderError::InvalidResponse("BCH amount overflow".to_string()))?;
+        let scale_factor = 10u128
+            .checked_pow(scale)
+            .ok_or_else(|| BchProviderError::InvalidResponse("BCH amount overflow".to_string()))?;
         unscaled
-            .checked_mul(10u128.pow(scale))
+            .checked_mul(scale_factor)
             .ok_or_else(|| BchProviderError::InvalidResponse("BCH amount overflow".to_string()))?
     } else {
         let scale = u32::try_from(decimal_places - 8)
@@ -593,7 +784,7 @@ fn parse_token_data(value: Option<&Value>) -> Result<Option<BchToken>, BchProvid
                     BchProviderError::InvalidResponse("invalid CashToken commitment".to_string())
                 })?
                 .unwrap_or_default();
-            if commitment.len() > 40 {
+            if commitment.len() > MAX_TOKEN_COMMITMENT_LENGTH {
                 return Err(BchProviderError::InvalidResponse(
                     "CashToken commitment is too large".to_string(),
                 ));
@@ -616,7 +807,7 @@ fn parse_token_data(value: Option<&Value>) -> Result<Option<BchToken>, BchProvid
     }))
 }
 
-fn parse_token_amount(value: &Value) -> Result<u64, BchProviderError> {
+pub(crate) fn parse_token_amount(value: &Value) -> Result<u64, BchProviderError> {
     let text = value
         .as_str()
         .map(str::to_owned)
@@ -640,10 +831,126 @@ fn parse_token_amount(value: &Value) -> Result<u64, BchProviderError> {
     Ok(amount)
 }
 
+/// Whether a server error means it does not know the transaction.
+///
+/// Fulcrum answers code 1, "No transaction matching the requested hash was
+/// found". bitcoind-style servers answer code -5. The message check matches the
+/// TypeScript provider.
+fn is_missing_transaction(error: &BchProviderError) -> bool {
+    match error {
+        BchProviderError::Remote { code: -5, .. } => true,
+        BchProviderError::Remote { message, .. } => {
+            let message = message.to_ascii_lowercase();
+            ["no transaction matching", "not found", "no such"]
+                .iter()
+                .any(|needle| message.contains(needle))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    struct FixedNode(Result<Value, BchProviderError>);
+
+    #[async_trait]
+    impl BchNodeRpc for FixedNode {
+        async fn request(&self, method: &str, params: Value) -> Result<Value, BchProviderError> {
+            assert_eq!(method, "testmempoolaccept");
+            assert!(params[0][0].is_string());
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn node_answers_test_mempool_accept() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = |node: Option<FixedNode>| {
+            let transport = TestTransport {
+                fail: false,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            let provider = FulcrumProvider::new(transport, BchChainReference::CHIPNET);
+            let provider = match node {
+                Some(node) => provider.with_node(node),
+                None => provider,
+            };
+            runtime.block_on(provider.test_mempool_accept(&[0x02, 0x00]))
+        };
+        assert_eq!(answer(None), None);
+        assert_eq!(
+            answer(Some(FixedNode(Ok(json!([{ "allowed": true }]))))),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            answer(Some(FixedNode(Ok(json!([{
+                "allowed": false,
+                "reject-reason": "mandatory-script-verify-flag-failed"
+            }]))))),
+            Some(Err("mandatory-script-verify-flag-failed".to_string()))
+        );
+        assert_eq!(
+            answer(Some(FixedNode(Err(BchProviderError::Transport(
+                "offline".to_string()
+            ))))),
+            None
+        );
+        assert_eq!(answer(Some(FixedNode(Ok(json!({ "busy": true }))))), None);
+    }
+
+    #[derive(Clone)]
+    struct RemoteErrorTransport(BchProviderError);
+
+    #[async_trait]
+    impl FulcrumTransport for RemoteErrorTransport {
+        async fn request(&self, _method: &str, _params: Value) -> Result<Value, BchProviderError> {
+            Err(self.0.clone())
+        }
+    }
+
+    /// A live Chipnet settlement broadcast successfully, then failed because
+    /// Fulcrum's code-1 "not found" answer for the new transaction was treated as
+    /// a provider error instead of a status.
+    #[test]
+    fn unknown_transaction_is_not_found() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = |error: BchProviderError| {
+            let provider =
+                FulcrumProvider::new(RemoteErrorTransport(error), BchChainReference::CHIPNET);
+            runtime.block_on(provider.transaction_status(&TxId([7; 32])))
+        };
+        for (code, message) in [
+            (1, "No transaction matching the requested hash was found"),
+            (-5, "No such mempool or blockchain transaction"),
+        ] {
+            let result = status(BchProviderError::Remote {
+                code,
+                message: message.to_string(),
+            });
+            assert_eq!(
+                result,
+                Ok(BchTransactionStatus::NotFound),
+                "{code}: {message}"
+            );
+        }
+        assert!(
+            status(BchProviderError::Remote {
+                code: 1,
+                message: "server busy".to_string(),
+            })
+            .is_err()
+        );
+        assert!(status(BchProviderError::Transport("offline".to_string())).is_err());
+    }
 
     #[derive(Clone)]
     struct TestTransport {
@@ -664,17 +971,62 @@ mod tests {
     }
 
     #[test]
+    fn parses_commitments_through_128_bytes_and_rejects_129() {
+        let category = "11".repeat(32);
+        for length in [0usize, 40, 41, 128] {
+            let commitment = "ab".repeat(length);
+            let parsed = parse_token_data(Some(&json!({
+                "category": category,
+                "amount": "0",
+                "nft": { "capability": "none", "commitment": commitment }
+            })))
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed.nft.unwrap().commitment.len(), length);
+        }
+        let error = parse_token_data(Some(&json!({
+            "category": category,
+            "amount": "1",
+            "nft": { "capability": "minting", "commitment": "cd".repeat(129) }
+        })))
+        .unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn token_amounts_keep_integers_above_the_javascript_safe_range() {
+        assert_eq!(
+            parse_token_amount(&json!("9007199254740993")).unwrap(),
+            9_007_199_254_740_993
+        );
+        assert_eq!(parse_token_amount(&json!(4)).unwrap(), 4);
+        assert!(parse_token_amount(&json!(1.5)).is_err());
+        assert!(parse_token_amount(&json!("01")).is_err());
+        assert!(parse_token_amount(&json!("9223372036854775808")).is_err());
+    }
+
+    #[test]
     fn parses_exact_bch_decimal_amounts_without_floating_point() {
         assert_eq!(parse_bch_amount(&json!("1.00000001")).unwrap(), 100_000_001);
         assert_eq!(parse_bch_amount(&json!("0.00000001")).unwrap(), 1);
         assert_eq!(parse_bch_amount(&json!(1e-8)).unwrap(), 1);
         assert!(parse_bch_amount(&json!("1.000000001")).is_err());
+        assert_eq!(parse_bch_amount(&json!("1e-2")).unwrap(), 1_000_000);
         assert_eq!(parse_satoshi_amount(&json!(1)).unwrap(), 1);
         assert_eq!(
             parse_satoshi_amount(&json!("100000000")).unwrap(),
             100_000_000
         );
         assert!(parse_satoshi_amount(&json!("0.00000001")).is_err());
+    }
+
+    #[test]
+    fn rejects_bch_amount_exponent_that_overflows_the_scale() {
+        let error = parse_bch_amount(&json!("1e100")).unwrap_err();
+        assert!(
+            matches!(error, BchProviderError::InvalidResponse(_)),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -709,6 +1061,81 @@ mod tests {
     #[test]
     fn rejects_an_empty_failover_set() {
         assert!(FailoverFulcrumTransport::<TestTransport>::new(vec![]).is_err());
+    }
+
+    /// A Fulcrum notification before the response is skipped, and errors
+    /// come back as remote errors, as with the TCP transport.
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_transport_matches_responses_by_id() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(text.as_str()).unwrap();
+                    let notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "blockchain.headers.subscribe",
+                        "params": [{ "height": 1 }]
+                    });
+                    socket.send(Message::text(notification.to_string())).await.unwrap();
+                    let reply = if request["method"] == "blockchain.headers.get_tip" {
+                        json!({ "jsonrpc": "2.0", "id": request["id"], "result": { "height": 326044 } })
+                    } else {
+                        json!({ "jsonrpc": "2.0", "id": request["id"], "error": { "code": 1, "message": "No transaction matching the requested hash was found" } })
+                    };
+                    socket.send(Message::text(reply.to_string())).await.unwrap();
+                }
+            });
+            let transport = FulcrumWebSocketTransport::connect(&format!("ws://{address}"))
+                .await
+                .unwrap();
+            let tip = transport
+                .request("blockchain.headers.get_tip", json!([]))
+                .await
+                .unwrap();
+            assert_eq!(tip["height"], 326044);
+            let provider = FulcrumProvider::new(transport, BchChainReference::CHIPNET);
+            assert_eq!(
+                provider.transaction_status(&TxId([7; 32])).await,
+                Ok(BchTransactionStatus::NotFound)
+            );
+            server.abort();
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    #[ignore = "requires BCH_FULCRUM_WSS_ENDPOINT for a live Chipnet provider"]
+    fn live_chipnet_fulcrum_websocket_smoke() {
+        let endpoint = std::env::var("BCH_FULCRUM_WSS_ENDPOINT")
+            .expect("BCH_FULCRUM_WSS_ENDPOINT must be set for the live smoke test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let transport = FulcrumWebSocketTransport::connect(&endpoint).await.unwrap();
+            let provider = FulcrumProvider::new(transport, BchChainReference::CHIPNET);
+            let payment =
+                TxId::from_hex("449fc5076c65559e77df28a071e8bab6c6ae2954a2e10583dc6d0899f7df5e45")
+                    .unwrap();
+            assert!(provider.tip_height().await.unwrap() > 0);
+            assert!(matches!(
+                provider.transaction_status(&payment).await.unwrap(),
+                BchTransactionStatus::Confirmed { height } if height > 0
+            ));
+        });
     }
 
     #[test]

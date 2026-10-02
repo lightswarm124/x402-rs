@@ -12,8 +12,8 @@ pub use client::{
 pub use facilitator::{BchConfirmationStrategy, BchFacilitatorConfig, V2BchExactFacilitator};
 pub use server::BchPaymentRequirements;
 pub use types::{
-    BchExtra, BchNftRequest, BchTokenRequest, BchTransactionNetwork, BchTransactionRequest,
-    ExactBchPayload, ExactScheme, PaymentPayload, PaymentRequirements,
+    BchExtra, BchNftRequest, BchRecipient, BchTokenRequest, BchTransactionNetwork,
+    BchTransactionRequest, ExactBchPayload, ExactScheme, PaymentPayload, PaymentRequirements,
 };
 
 use x402_types::scheme::X402SchemeId;

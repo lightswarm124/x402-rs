@@ -6,5 +6,7 @@ crates/*/target/
 facilitator/target/
 facilitator/config.json
 examples/*/.env
+examples/bch-browser/pkg/
+examples/bch-browser/node_modules/
 protocol-conformance/node_modules/
 protocol-conformance/.env
